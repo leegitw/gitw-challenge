@@ -1,77 +1,90 @@
 package main
 
 import (
-	"encoding/json"
-	"fmt"
-	"log"
-	"net/http"
-	"path/filepath"
-	"strings"
 	"crypto/md5"
 	"encoding/hex"
-	"sync"
-	"os"
+	"encoding/json"
+	"fmt"
 	"io/ioutil"
+	"log"
+	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strconv"
+	"strings"
+	"sync"
 
 	"github.com/ant0ine/go-json-rest/rest"
 )
 
 const HTTP_PORT = 8088
-const MEMCACHE_HOST = "localhost"
-const MEMCACHE_PORT = 11211
 const CACHE_KEY_PREFIX = "chall3"
 const CACHE_KEY_VERSION = "v1"
-const STORE_DIR = "/Users/leebrown/go/src/github.com/leetune/chall3/store"
+const STORE_DIR = "store"
 
 var store = map[string]*CacheEntry{}
 var storeStats = map[string]int{}
 
-var lockStore = sync.RWMutex{}
-var lockStats = sync.RWMutex{}
+var lockStore = &sync.Mutex{}
+var lockStats = &sync.Mutex{}
 
 func initStore() {
 
 	fileList := []string{}
 	statList := []string{}
-    err := filepath.Walk(STORE_DIR, func(path string, f os.FileInfo, err error) error {
-    	if strings.HasSuffix(path, "json") == true {
-        	fileList = append(fileList, path)
-    	} else if strings.HasSuffix(path, "cnt") == true {
-        	statList = append(statList, path)
-    	}
-        return nil
-    })
+	err := filepath.Walk(STORE_DIR, func(path string, f os.FileInfo, err error) error {
+		if strings.HasSuffix(path, "json") == true {
+			fileList = append(fileList, path)
+		} else if strings.HasSuffix(path, "cnt") == true {
+			statList = append(statList, path)
+		}
+		return nil
+	})
 
-    log.Println(fileList)
-
-    lockStore.Lock()
-    for _, fp := range fileList {
+	lockStore.Lock()
+	for _, fp := range fileList {
 		b, _ := ioutil.ReadFile(fp)
+
+		fName := filepath.Base(fp)
+		extName := filepath.Ext(fp)
+		key := fName[:len(fName)-len(extName)]
 
 		item := &CacheEntry{}
 		err = json.Unmarshal(b, &item)
 		if err == nil {
-			key, err := item.GetCacheKey()
-			if err == nil {
-				store[key] = item 
+			switch item.valueType {
+			case "string":
+				sc := item.Value.(string)
+				item.Value = sc
+			case "int":
+				sc := item.Value.(int)
+				item.Value = sc
+			case "float64":
+				sc := item.Value.(float64)
+				item.Value = sc
+			case "bool":
+				sc := item.Value.(bool)
+				item.Value = sc
 			}
-		}
-    }
-    lockStore.Unlock()
 
+			store[key] = item
+		}
+	}
+	lockStore.Unlock()
 
 	lockStats.Lock()
-    for _, fp := range statList {
+	for _, fp := range statList {
 		b, _ := ioutil.ReadFile(fp)
 		bStr := string(b)
 
 		fName := filepath.Base(fp)
 		extName := filepath.Ext(fp)
-		bName := fName[:len(fName)-len(extName)]
-		storeStats[bName] = len(bStr)
-    }
-    lockStats.Unlock()
+		key := fName[:len(fName)-len(extName)]
+		storeStats[key] = len(bStr)
+	}
+	lockStats.Unlock()
 }
 
 func main() {
@@ -84,7 +97,6 @@ func main() {
 		},
 		&rest.RecoverMiddleware{},
 	}
-
 
 	var err error
 	api := rest.NewApi()
@@ -103,7 +115,6 @@ func main() {
 		AccessControlAllowCredentials: true,
 		AccessControlMaxAge:           3600,
 	}) */
-
 
 	router, err := rest.MakeRouter(
 		&rest.Route{"POST", "/cache", handleCachePost},
@@ -132,32 +143,44 @@ func main() {
 func handleCachePost(w rest.ResponseWriter, r *rest.Request) {
 
 	item := &CacheEntry{}
-    err := r.DecodeJsonPayload(&item)
-    if err != nil {
-    	log.Println(err)
-    	w.WriteHeader(http.StatusNotAcceptable)
-    	return
-    }
+	err := r.DecodeJsonPayload(&item)
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusNotAcceptable)
+		return
+	}
 
-    key, err := item.GetCacheKey()
-    if err != nil {
-    	log.Println(err)
-    	w.WriteHeader(http.StatusInternalServerError)
-    	return
-    }
+	key, err := item.GetCacheKey()
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 
 	lockStore.Lock()
 	_, ok := store[key]
+	if !ok {
+		var obj = reflect.ValueOf(&item.Value)
+		switch obj.Elem().Interface().(type) {
+		case string:
+			item.valueType = "string"
+		case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+			item.valueType = "int"
+		case float32, float64:
+			item.valueType = "float64"
+		case bool:
+			item.valueType = "bool"
+		}
+
+		store[key] = item
+		item.WriteLocal(key)
+	}
+	lockStore.Unlock()
+
 	if ok {
 		w.WriteHeader(http.StatusConflict)
 	} else {
 		w.WriteHeader(http.StatusCreated)
-		store[key] = item
-	}
-	lockStore.Unlock()
-
-	if ok == false {
-		go item.WriteLocal()
 	}
 }
 
@@ -165,43 +188,50 @@ func handleCacheKeyPost(w rest.ResponseWriter, r *rest.Request) {
 	keyStr, _ := url.QueryUnescape(r.PathParam("key"))
 
 	item := &CacheEntry{}
-    err := r.DecodeJsonPayload(&item)
-    if err != nil {
-    	log.Println(err)
-    	w.WriteHeader(http.StatusNotAcceptable)
-    	return
-    }
+	err := r.DecodeJsonPayload(&item)
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusNotAcceptable)
+		return
+	}
 
-    key, err := item.GetCacheKey()
-    if len(key) == 0 {
-    	item.Key = keyStr
-    	key, err = item.GetCacheKey()
-    }
-    
-    if err != nil {
-    	log.Println(err)
-    	w.WriteHeader(http.StatusInternalServerError)
-    	return
-    }    
+	key, err := item.GetCacheKey()
+	if len(key) == 0 {
+		item.Key = keyStr
+		key, err = item.GetCacheKey()
+	}
 
-    log.Println("put", key, item.Key, "->", item.Value)
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 
 	lockStore.Lock()
-	curItem, ok := store[key]
+	_, ok := store[key]
 	if ok {
-		log.Println("hit", key, curItem.Key, "->", curItem.Value)
-		w.WriteHeader(http.StatusNoContent)
+		var obj = reflect.ValueOf(&item.Value)
+		switch obj.Elem().Interface().(type) {
+		case string:
+			item.valueType = "string"
+		case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+			item.valueType = "int"
+		case float32, float64:
+			item.valueType = "float64"
+		case bool:
+			item.valueType = "bool"
+		}
+
 		store[key] = item
+		item.WriteLocal(key)
+	}
+	lockStore.Unlock()
+
+	if ok {
+		w.WriteHeader(http.StatusNoContent)
 	} else {
-		log.Println("miss", key)
-
 		w.WriteHeader(http.StatusNotFound)
-	}    
-    lockStore.Unlock()
-
-    if ok == false {
-    	go item.WriteLocal()
-    }
+	}
 }
 
 func handleCacheKeyGetAdd(w rest.ResponseWriter, r *rest.Request) {
@@ -209,35 +239,50 @@ func handleCacheKeyGetAdd(w rest.ResponseWriter, r *rest.Request) {
 	value, _ := url.QueryUnescape(r.PathParam("value"))
 
 	item := &CacheEntry{
-		Key: keyStr,
+		Key:   keyStr,
 		Value: value,
 	}
 
-    key, err := item.GetCacheKey()
-    if err != nil {
-    	log.Println(err)
-    	w.WriteHeader(http.StatusInternalServerError)
-    	return
-    }
+	key, err := item.GetCacheKey()
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 
 	lockStore.Lock()
 	store[key] = item
-    lockStore.Unlock()
-    w.WriteHeader(http.StatusAccepted)
+	item.WriteLocal(key)
+	lockStore.Unlock()
 
-    go item.WriteLocal()
+	w.WriteHeader(http.StatusAccepted)
 }
 
-func handleCacheGet(w rest.ResponseWriter, r *rest.Request) {	
-	lockStore.RLock()
-    curItems := store
-    lockStore.RUnlock()
-
+func handleCacheGet(w rest.ResponseWriter, r *rest.Request) {
 	res := CacheResMulti{}
+	lockStore.Lock()
+	lockStats.Lock()
+	for key, item := range store {
+		if curCnt, ok := storeStats[key]; ok {
+			curCnt++
 
-	for _, item := range curItems {
+			if curCnt >= 100 {
+				delete(store, key)
+				delete(storeStats, key)
+
+				item.DeleteLocal(key)
+			} else {
+				storeStats[key] = curCnt
+				item.IncLocal(key, false)
+			}
+		} else {
+			storeStats[key] = 1
+		}
+
 		res.Items = append(res.Items, *item)
 	}
+	lockStore.Unlock()
+	lockStats.Unlock()
 
 	w.WriteJson(res)
 }
@@ -249,59 +294,75 @@ func handleCacheKeyGet(w rest.ResponseWriter, r *rest.Request) {
 		Key: keyStr,
 	}
 
-    key, err := item.GetCacheKey()
-    if err != nil {
-    	log.Println(err)
-    	w.WriteHeader(http.StatusInternalServerError)
-    	return
-    }
+	key, err := item.GetCacheKey()
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 
-	lockStore.RLock()
-	item, ok := store[key]
-	lockStore.RUnlock()
+	svals := []string{
+		key,
+	}
+
+	if keyStr != "" {
+		switch key := item.Key.(type) {
+		case string:
+			if _, err := strconv.Atoi(key); err == nil {
+				svals = append(svals, "i"+GetMD5Hash(key))
+			}
+		}
+	}
+
+	var ok bool
+	lockStore.Lock()
+	lockStats.Lock()
+	for _, skey := range svals {
+		item, ok = store[skey]
+		if ok == true {
+			if curCnt, ok := storeStats[skey]; ok {
+				curCnt++
+
+				if curCnt >= 100 {
+					delete(store, skey)
+					delete(storeStats, skey)
+
+					item.DeleteLocal(skey)
+				} else {
+					storeStats[skey] = curCnt
+					item.IncLocal(skey, false)
+				}
+			} else {
+				storeStats[skey] = 1
+			}
+
+			break
+		}
+	}
+	lockStore.Unlock()
+	lockStats.Unlock()
 
 	if ok {
-    	w.WriteJson(item)
-    	w.WriteHeader(http.StatusOK)
-
-	    doReset := false
-		lockStats.Lock()
-		if curCnt, ok := storeStats[key]; ok {
-			if curCnt >= 100 {
-					storeStats[key] = 0
-					doReset = true
-
-					lockStore.Lock()
-					delete(store, key)
-					lockStore.Unlock()
-
-					item.DeleteLocal()
-				} else {
-					storeStats[key]++
-
-				}
-	    } else {
-	    	storeStats[key] = 1
-	    }
-	    lockStats.Unlock()
-
-	    go item.IncLocal(doReset)    	
-    } else {
-    	w.WriteHeader(http.StatusNotFound)
-    }  
+		w.WriteHeader(http.StatusOK)
+		w.WriteJson(item)
+	} else {
+		w.WriteHeader(http.StatusNotFound)
+	}
 }
 
 func handleCacheDelete(w rest.ResponseWriter, r *rest.Request) {
-	lockStore.RLock()
-    store = map[string]*CacheEntry{}
-    lockStore.RUnlock()
+	lockStore.Lock()
 
-    err := filepath.Walk(STORE_DIR, func(path string, f os.FileInfo, err error) error {
-    	if strings.HasSuffix(path, "json") == true ||  strings.HasSuffix(path, "cnt") == true {
-    	os.Remove(path)
-    }
-        return nil
-    })
+	store = map[string]*CacheEntry{}
+
+	err := filepath.Walk(STORE_DIR, func(path string, f os.FileInfo, err error) error {
+		if strings.HasSuffix(path, "json") == true || strings.HasSuffix(path, "cnt") == true {
+			os.Remove(path)
+		}
+		return nil
+	})
+
+	lockStore.Unlock()
 
 	if err != nil {
 		log.Println(err)
@@ -317,28 +378,49 @@ func handleCacheKeyDelete(w rest.ResponseWriter, r *rest.Request) {
 	item := &CacheEntry{
 		Key: keyStr,
 	}
-	
-    key, err := item.GetCacheKey()
-    if err != nil {
-    	log.Println(err)
-    	w.WriteHeader(http.StatusInternalServerError)
-    	return
-    }
 
+	key, err := item.GetCacheKey()
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	svals := []string{
+		key,
+	}
+
+	if keyStr != "" {
+		switch key := item.Key.(type) {
+		case string:
+			if _, err := strconv.Atoi(key); err == nil {
+				svals = append(svals, "i"+GetMD5Hash(key))
+			} else if key == "true" || key == "false" {
+				svals = append(svals, "b"+GetMD5Hash(key))
+			}
+		}
+	}
+
+	var ok bool
 	lockStore.Lock()
-	item, ok := store[key]
-	if ok {
-		delete(store, key)
+	lockStats.Lock()
+	for _, skey := range svals {
+		item, ok = store[skey]
+		if ok == true {
+			delete(store, skey)
+			delete(storeStats, skey)
+			item.DeleteLocal(skey)
+			break
+		}
+	}
+	lockStore.Unlock()
+	lockStats.Unlock()
 
-    	w.WriteHeader(http.StatusNoContent)
-    } else {
-    	w.WriteHeader(http.StatusNotFound)
-    }
-    lockStore.Unlock()
-
 	if ok {
-		go item.DeleteLocal()
-    } 
+		w.WriteHeader(http.StatusNoContent)
+	} else {
+		w.WriteHeader(http.StatusNotFound)
+	}
 }
 
 type CacheResMulti struct {
@@ -346,33 +428,36 @@ type CacheResMulti struct {
 }
 
 type CacheEntry struct {
-	Key interface{} `json:"key"`
-	Value interface{} `json:"value"`
+	Key       interface{} `json:"key"`
+	Value     interface{} `json:"value"`
+	valueType string      `json:"value_type"`
 }
 
 func (item CacheEntry) GetCacheKey() (string, error) {
 	switch key := item.Key.(type) {
-        case string:
-            return "s"+GetMD5Hash(key), nil
-        case int,int8,int16,int32,int64,uint,uint8,uint16,uint32,uint64:
-            return "i"+GetMD5Hash(fmt.Sprintf("%d", key)), nil
-        case float32, float64:
-        	return "f"+GetMD5Hash(fmt.Sprintf("%v", key)), nil
-        case bool:
-        	if key == true {
-        		return "b"+GetMD5Hash("true"), nil
-        	} else {
-        		return "b"+GetMD5Hash("false"), nil
-        	}
-    }
+	case string:
+		return "s" + GetMD5Hash(key), nil
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return "i" + GetMD5Hash(fmt.Sprintf("%d", key)), nil
+	case float32, float64:
+		ks := fmt.Sprintf("%v", key)
+		if strings.Contains(ks, ".") == false {
+			return "i" + GetMD5Hash(ks), nil
+		}
+		return "f" + GetMD5Hash(ks), nil
+	case bool:
+		if key == true {
+			return "b" + GetMD5Hash("true"), nil
+		} else {
+			return "b" + GetMD5Hash("false"), nil
+		}
+	}
 
-    return "", fmt.Errorf("No cast defined for %v", item.Key)
+	return "", fmt.Errorf("No cast defined for %v", item.Key)
 }
 
-func (item *CacheEntry) DeleteLocal() (error) {
-	key, _ := item.GetCacheKey()
-
-	fpaths :=[]string{
+func (item *CacheEntry) DeleteLocal(key string) error {
+	fpaths := []string{
 		fmt.Sprintf("%s/%s.json", STORE_DIR, key),
 		fmt.Sprintf("%s/%s.cnt", STORE_DIR, key),
 	}
@@ -384,8 +469,7 @@ func (item *CacheEntry) DeleteLocal() (error) {
 	return nil
 }
 
-func (item *CacheEntry) WriteLocal() (error) {
-	key, _ := item.GetCacheKey()
+func (item *CacheEntry) WriteLocal(key string) error {
 	fpath := fmt.Sprintf("%s/%s.json", STORE_DIR, key)
 
 	b, err := json.Marshal(item)
@@ -396,8 +480,7 @@ func (item *CacheEntry) WriteLocal() (error) {
 	return nil
 }
 
-func (item *CacheEntry) IncLocal(doReset bool) (error) {
-	key, _ := item.GetCacheKey()
+func (item *CacheEntry) IncLocal(key string, doReset bool) error {
 	fpath := fmt.Sprintf("%s/%s.cnt", STORE_DIR, key)
 
 	if doReset == true {
@@ -415,7 +498,7 @@ func (item *CacheEntry) IncLocal(doReset bool) (error) {
 	defer f.Close()
 
 	if _, err = f.WriteString("1"); err != nil {
-	    return err
+		return err
 	}
 
 	return nil
